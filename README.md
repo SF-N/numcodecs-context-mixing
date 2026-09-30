@@ -29,6 +29,8 @@ codec = MaskMetaCodec(
 )
 ```
 
+The low-level primitives (range coder, bit models, mixer, context hashing) are exposed in `numcodecs_context_mixing.coder` for building further context-mixing codecs.
+
 [`numcodecs`]: https://numcodecs.readthedocs.io/en/stable/
 
 ## License

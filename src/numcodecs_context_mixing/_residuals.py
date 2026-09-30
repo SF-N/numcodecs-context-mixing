@@ -11,7 +11,7 @@ predictors and the neighbouring residuals in the current and previous slice.
 import numpy as np
 from numba import njit
 
-from ._coder import (
+from .coder import (
     MODEL_ONE,
     _bucket,
     _dec_bit,

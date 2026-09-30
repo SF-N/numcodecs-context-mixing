@@ -1,9 +1,12 @@
 """
-Binary range coder (LZMA-style, 12-bit probabilities) and context-mixing
-primitives shared by all coders in this package.
+Low-level building blocks for context-mixing codecs: a binary range coder
+(LZMA-style, 12-bit probabilities), adaptive bit models, a logistic mixer,
+context hashing and a few bucketing helpers.
 
 All functions are numba-compiled and operate on plain NumPy arrays so that the
-encoder and decoder execute exactly the same arithmetic.
+encoder and decoder execute exactly the same arithmetic. They are shared by
+the coders in this package and can be used to build further context-mixing
+codecs (e.g. [`numcodecs-interp-ctx`](https://github.com/SF-N/numcodecs-interp-ctx)).
 """
 
 import math

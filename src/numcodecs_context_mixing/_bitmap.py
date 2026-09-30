@@ -3,7 +3,7 @@
 import numpy as np
 from numba import njit
 
-from ._coder import (
+from .coder import (
     MODEL_ONE,
     _dec_bit,
     _dec_init,
