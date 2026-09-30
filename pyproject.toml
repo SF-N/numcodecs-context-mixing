@@ -13,6 +13,7 @@ dependencies = [
     "leb128~=1.0.8",
     "numcodecs>=0.13.0,<0.17",
     "numba>=0.60",
+    "numcodecs-mask>=0.1.0",
     "numpy~=2.0",
     "typing-extensions~=4.6",
 ]
@@ -39,5 +40,9 @@ addopts = ["--import-mode=importlib"]
 xfail_strict = true
 
 [[tool.mypy.overrides]]
-module = ["leb128.*", "numcodecs.*", "numba.*"]
+module = ["leb128.*", "numcodecs.*", "numba.*", "numcodecs_mask.*"]
 follow_untyped_imports = true
+
+[tool.uv.sources]
+# until https://github.com/juntyr/numcodecs-mask/pull/4 (MaskAwareCodecMixin) is released
+numcodecs-mask = { git = "https://github.com/SF-N/numcodecs-mask", branch = "mask-aware-codecs" }

@@ -28,10 +28,12 @@ MAX_BITS = 16
 
 
 @njit(cache=True)
-def _neighbours(q, t, i, j, T, Y, X, nb):
-    # neighbour symbols, or -1 outside the array
+def _neighbours(q, m, t, i, j, T, Y, X, nb):
+    # neighbour symbols, or -1 outside the array / at masked positions
     def g(tt, ii, jj):
         if ii < 0 or ii >= Y or jj < 0 or jj >= X or tt < 0:
+            return -1
+        if m[tt, ii, jj] == 1:
             return -1
         return q[tt, ii, jj]
 
@@ -73,7 +75,7 @@ def _pred(nb):
 
 
 @njit(cache=True)
-def _code_symbols(q, T, Y, X, nbits, out, inp, state, encode, lr, lim):
+def _code_symbols(q, m, T, Y, X, nbits, out, inp, state, encode, lr, lim):
     probs = np.full((NMODELS, 1 << TABLE_BITS), MODEL_ONE // 2, np.int32)
     counts = np.zeros((NMODELS, 1 << TABLE_BITS), np.uint8)
     nnodes = 1 << nbits
@@ -86,7 +88,9 @@ def _code_symbols(q, T, Y, X, nbits, out, inp, state, encode, lr, lim):
     for t in range(T):
         for i in range(Y):
             for j in range(X):
-                _neighbours(q, t, i, j, T, Y, X, nb)
+                if m[t, i, j] == 1:
+                    continue
+                _neighbours(q, m, t, i, j, T, Y, X, nb)
                 L, U, UL, UR, LL, UU = nb[0], nb[1], nb[2], nb[3], nb[4], nb[5]
                 P, PR, URR = nb[6], nb[7], nb[9]
                 pred = _pred(nb)
@@ -148,23 +152,25 @@ def _code_symbols(q, T, Y, X, nbits, out, inp, state, encode, lr, lim):
 
 
 @njit(cache=True)
-def encode_symbols(q, nbits, out, lr, lim):
-    """Encode the non-negative int64 array `q` of shape (T, Y, X); returns the length."""
+def encode_symbols(q, m, nbits, out, lr, lim):
+    """Encode the non-negative int64 array `q` of shape (T, Y, X), skipping the
+    positions where the uint8 mask `m` is 1; returns the length."""
     T, Y, X = q.shape
     state = np.zeros(5, np.int64)
     _enc_init(state)
     dummy = np.zeros(1, np.uint8)
-    _code_symbols(q, T, Y, X, nbits, out, dummy, state, True, lr, lim)
+    _code_symbols(q, m, T, Y, X, nbits, out, dummy, state, True, lr, lim)
     _enc_flush(state, out)
     return state[4]
 
 
 @njit(cache=True)
-def decode_symbols(inp, T, Y, X, nbits, lr, lim):
-    """Decode a non-negative int64 array of shape (T, Y, X) from the bytes `inp`."""
+def decode_symbols(inp, m, T, Y, X, nbits, lr, lim):
+    """Decode a non-negative int64 array of shape (T, Y, X) from the bytes `inp`;
+    positions where the uint8 mask `m` is 1 were skipped and decode to 0."""
     state = np.zeros(5, np.int64)
     _dec_init(inp, state)
     q = np.zeros((T, Y, X), np.int64)
     dummy = np.zeros(1, np.uint8)
-    _code_symbols(q, T, Y, X, nbits, dummy, inp, state, False, lr, lim)
+    _code_symbols(q, m, T, Y, X, nbits, dummy, inp, state, False, lr, lim)
     return q

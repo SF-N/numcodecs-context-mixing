@@ -128,3 +128,32 @@ def test_compression():
     noisy = np.random.default_rng(3).integers(0, 4, size=(200, 300)).astype(np.uint8)
     size = check_roundtrip("context_mixing.symbols", noisy)
     assert size < noisy.nbytes / 3.5  # ~2 bits/symbol entropy + overhead
+
+
+@pytest.mark.parametrize(
+    "codec_id", ["context_mixing.symbols", "context_mixing.residuals"]
+)
+def test_masked(codec_id):
+    rng = np.random.default_rng(4)
+    yy, xx = np.mgrid[0:50, 0:70]
+    data = np.rint(8 * np.sin(yy / 7.0) * np.cos(xx / 11.0)).astype(np.int16)
+    mask = rng.random(data.shape) < 0.4
+    garbage = np.where(mask, np.int16(-30000), data)  # masked values are irrelevant
+
+    codec = numcodecs.registry.get_codec(dict(id=codec_id))
+    encoded = codec.encode_masked(garbage, mask)
+    decoded = np.asarray(codec.decode_masked(encoded, mask))
+    assert decoded.dtype == data.dtype and decoded.shape == data.shape
+    np.testing.assert_array_equal(decoded[~mask], data[~mask])
+
+    # skipping the masked values saves bits compared to coding the garbage
+    assert len(encoded) < len(codec.encode(garbage))
+
+    # ... and composes with the mask meta-codec, which passes the mask on
+    from numcodecs_mask import MaskMetaCodec
+
+    values = np.where(mask, np.int16(0), data)
+    meta = MaskMetaCodec(
+        mask=0, codec=dict(id=codec_id), bitmap_codec=dict(id="context_mixing.bitmap")
+    )
+    np.testing.assert_array_equal(meta.decode(meta.encode(values)), values)

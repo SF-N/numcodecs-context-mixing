@@ -34,7 +34,7 @@ MAX_BITS = 60
 
 
 @njit(cache=True)
-def _code_residuals(q, T, Y, X, nbits, out, inp, state, encode, lr, lim):
+def _code_residuals(q, m, T, Y, X, nbits, out, inp, state, encode, lr, lim):
     tsize = 1 << TABLE_BITS
     tmask = tsize - 1
     probs = np.full((NMODELS, tsize), MODEL_ONE // 2, np.int32)
@@ -55,15 +55,26 @@ def _code_residuals(q, T, Y, X, nbits, out, inp, state, encode, lr, lim):
     for t in range(T):
         for i in range(Y):
             for j in range(X):
-                # causal neighbours (current slice), -1 outside
-                L = q[t, i, j - 1] if j > 0 else -1
-                U = q[t, i - 1, j] if i > 0 else -1
-                UL = q[t, i - 1, j - 1] if (i > 0 and j > 0) else -1
-                UR = q[t, i - 1, j + 1] if (i > 0 and j + 1 < X) else -1
-                LL = q[t, i, j - 2] if j > 1 else -1
-                UU = q[t, i - 2, j] if i > 1 else -1
+                res[i, j] = 0
+                if m[t, i, j] == 1:
+                    continue
+                # causal neighbours (current slice), -1 outside or masked
+                L = q[t, i, j - 1] if (j > 0 and m[t, i, j - 1] == 0) else -1
+                U = q[t, i - 1, j] if (i > 0 and m[t, i - 1, j] == 0) else -1
+                UL = (
+                    q[t, i - 1, j - 1]
+                    if (i > 0 and j > 0 and m[t, i - 1, j - 1] == 0)
+                    else -1
+                )
+                UR = (
+                    q[t, i - 1, j + 1]
+                    if (i > 0 and j + 1 < X and m[t, i - 1, j + 1] == 0)
+                    else -1
+                )
+                LL = q[t, i, j - 2] if (j > 1 and m[t, i, j - 2] == 0) else -1
+                UU = q[t, i - 2, j] if (i > 1 and m[t, i - 2, j] == 0) else -1
                 # previous slice
-                P = q[t - 1, i, j] if t > 0 else -1
+                P = q[t - 1, i, j] if (t > 0 and m[t - 1, i, j] == 0) else -1
 
                 # --- spatial prediction
                 if L >= 0 and U >= 0 and UL >= 0:
@@ -86,9 +97,21 @@ def _code_residuals(q, T, Y, X, nbits, out, inp, state, encode, lr, lim):
                 have_tim = P >= 0
                 ptim = pmed
                 if have_tim:
-                    dL = (L - q[t - 1, i, j - 1]) if L >= 0 else -100000
-                    dU = (U - q[t - 1, i - 1, j]) if U >= 0 else -100000
-                    dUL = (UL - q[t - 1, i - 1, j - 1]) if UL >= 0 else -100000
+                    dL = (
+                        (L - q[t - 1, i, j - 1])
+                        if (L >= 0 and m[t - 1, i, j - 1] == 0)
+                        else -100000
+                    )
+                    dU = (
+                        (U - q[t - 1, i - 1, j])
+                        if (U >= 0 and m[t - 1, i - 1, j] == 0)
+                        else -100000
+                    )
+                    dUL = (
+                        (UL - q[t - 1, i - 1, j - 1])
+                        if (UL >= 0 and m[t - 1, i - 1, j - 1] == 0)
+                        else -100000
+                    )
                     if dL > -100000 and dU > -100000 and dUL > -100000:
                         ptim = P + _med(dL, dU, dUL)
                     elif dL > -100000 and dU > -100000:
@@ -186,23 +209,25 @@ def _code_residuals(q, T, Y, X, nbits, out, inp, state, encode, lr, lim):
 
 
 @njit(cache=True)
-def encode_residuals(q, nbits, out, lr, lim):
-    """Encode the non-negative int64 array `q` of shape (T, Y, X); returns the length."""
+def encode_residuals(q, m, nbits, out, lr, lim):
+    """Encode the non-negative int64 array `q` of shape (T, Y, X), skipping the
+    positions where the uint8 mask `m` is 1; returns the length."""
     T, Y, X = q.shape
     state = np.zeros(5, np.int64)
     _enc_init(state)
     dummy = np.zeros(1, np.uint8)
-    _code_residuals(q, T, Y, X, nbits, out, dummy, state, True, lr, lim)
+    _code_residuals(q, m, T, Y, X, nbits, out, dummy, state, True, lr, lim)
     _enc_flush(state, out)
     return state[4]
 
 
 @njit(cache=True)
-def decode_residuals(inp, T, Y, X, nbits, lr, lim):
-    """Decode a non-negative int64 array of shape (T, Y, X) from the bytes `inp`."""
+def decode_residuals(inp, m, T, Y, X, nbits, lr, lim):
+    """Decode a non-negative int64 array of shape (T, Y, X) from the bytes `inp`;
+    positions where the uint8 mask `m` is 1 were skipped and decode to 0."""
     state = np.zeros(5, np.int64)
     _dec_init(inp, state)
     q = np.zeros((T, Y, X), np.int64)
     dummy = np.zeros(1, np.uint8)
-    _code_residuals(q, T, Y, X, nbits, dummy, inp, state, False, lr, lim)
+    _code_residuals(q, m, T, Y, X, nbits, dummy, inp, state, False, lr, lim)
     return q

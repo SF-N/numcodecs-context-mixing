@@ -4,7 +4,9 @@ Context-mixing arithmetic coders for integer and boolean arrays for the
 
 All coders interpret the data as a stack of 2D slices `[..., rows, cols]` and
 use causal neighbours in the current slice as well as the previous slice as
-contexts. They are lossless.
+contexts. They are lossless. The integer coders implement the
+[`MaskAwareCodecMixin`][numcodecs_mask.abc.MaskAwareCodecMixin] and skip
+masked values entirely.
 """
 
 __all__ = [
@@ -22,9 +24,12 @@ import numcodecs.compat
 import numcodecs.registry
 import numpy as np
 from numcodecs.abc import Codec
+from numcodecs_mask.abc import MaskAwareCodecMixin
 from typing_extensions import Buffer  # MSPV 3.12
 
 from . import _bitmap, _residuals, _symbols
+
+Mask = np.ndarray[tuple[int, ...], np.dtype[np.bool]]
 
 
 def _as_slices(shape: tuple[int, ...]) -> tuple[int, int, int]:
@@ -68,6 +73,17 @@ def _check_rates(mixer_rate: float, model_floor: float) -> None:
 def _padded_input(b: bytes) -> np.ndarray:
     # the range decoder may read a few bytes past the end of the stream
     return np.concatenate([np.frombuffer(b, np.uint8), np.zeros(16, np.uint8)])
+
+
+def _mask_slices(mask: None | Mask, shape: tuple[int, ...]) -> np.ndarray:
+    """The mask as a contiguous uint8 array of shape (slices, rows, cols)."""
+
+    T, Y, X = _as_slices(shape)
+    if mask is None:
+        return np.zeros((T, Y, X), dtype=np.uint8)
+    return np.ascontiguousarray(
+        np.asarray(mask, dtype=np.bool).astype(np.uint8).reshape(T, Y, X)
+    )
 
 
 class ContextMixingBitmapCodec(Codec):
@@ -206,9 +222,10 @@ class ContextMixingBitmapCodec(Codec):
         return f"{type(self).__name__}(mixer_rate={self._mixer_rate!r}, model_floor={self._model_floor!r})"
 
 
-class _IntegerContextMixingCodec(Codec):
+class _IntegerContextMixingCodec(Codec, MaskAwareCodecMixin):
     """Shared implementation of the integer coders (values are shifted to be
-    non-negative and coded with `nbits` bits per symbol)."""
+    non-negative and coded with `nbits` bits per symbol; masked positions are
+    skipped and treated as missing in the contexts)."""
 
     __slots__: tuple[str, ...] = ("_mixer_rate", "_model_floor")
     _mixer_rate: float
@@ -221,12 +238,15 @@ class _IntegerContextMixingCodec(Codec):
         self._mixer_rate = float(mixer_rate)
         self._model_floor = float(model_floor)
 
-    def _encode_values(self, q: np.ndarray, nbits: int, out: np.ndarray) -> int:
+    def _encode_values(
+        self, q: np.ndarray, m: np.ndarray, nbits: int, out: np.ndarray
+    ) -> int:
         raise NotImplementedError  # pragma: no cover
 
     def _decode_values(
         self,
         inp: np.ndarray,
+        m: np.ndarray,
         T: int,
         Y: int,
         X: int,
@@ -252,6 +272,33 @@ class _IntegerContextMixingCodec(Codec):
             Encoded data as a bytestring.
         """
 
+        return self._encode(buf, None)
+
+    def encode_masked(self, buf: Buffer, mask: Mask) -> bytes:
+        """
+        Encode the integer data in `buf`, skipping the values where `mask` is
+        [`True`][True]: no bits are spent on them and they are treated as
+        missing in the contexts of their neighbours.
+
+        Parameters
+        ----------
+        buf : Buffer
+            Integer (or boolean) data to be encoded. May be any object
+            supporting the new-style buffer protocol. The values at masked
+            positions are unspecified.
+        mask : np.ndarray[tuple[int, ...], np.dtype[np.bool]]
+            The [boolean][numpy.bool] mask, of the same shape as the data, of
+            the values that do not need to be preserved.
+
+        Returns
+        -------
+        enc : bytes
+            Encoded data as a bytestring.
+        """
+
+        return self._encode(buf, mask)
+
+    def _encode(self, buf: Buffer, mask: None | Mask) -> bytes:
         a = numcodecs.compat.ensure_ndarray(buf)
         dtype, shape = a.dtype, a.shape
 
@@ -259,18 +306,24 @@ class _IntegerContextMixingCodec(Codec):
             raise TypeError("can only encode integer or boolean values")
 
         values = a.astype(np.int64)
-        minimum = int(values.min()) if values.size > 0 else 0
-        maximum = int(values.max()) if values.size > 0 else 0
+        m = _mask_slices(mask, shape)
+        is_masked = m.reshape(shape).astype(np.bool)
+
+        kept = values[~is_masked]
+        minimum = int(kept.min()) if kept.size > 0 else 0
+        maximum = int(kept.max()) if kept.size > 0 else 0
         nbits = max(1, int(maximum - minimum).bit_length())
         if nbits > self._max_bits:
             raise ValueError(
                 f"the value range {maximum - minimum} exceeds the {self._max_bits}-bit limit of this codec"
             )
 
-        q = np.ascontiguousarray((values - minimum).reshape(_as_slices(shape)))
+        q = np.ascontiguousarray(
+            np.where(is_masked, 0, values - minimum).reshape(m.shape)
+        )
 
         out = np.zeros(q.size * 8 + 1024, np.uint8)
-        n = self._encode_values(q, nbits, out)
+        n = self._encode_values(q, m, nbits, out)
 
         # message: dtype shape minimum nbits rates values
         message = _write_header(dtype, shape)
@@ -306,6 +359,37 @@ class _IntegerContextMixingCodec(Codec):
             protocol.
         """
 
+        return self._decode(buf, None, out)
+
+    def decode_masked(
+        self, buf: Buffer, mask: Mask, out: None | Buffer = None
+    ) -> Buffer:
+        """
+        Decode the integer data in `buf`, which was encoded with the same
+        `mask`.
+
+        Parameters
+        ----------
+        buf : Buffer
+            Encoded data. Must be an object representing a bytestring, e.g.
+            [`bytes`][bytes] or a 1D array of [`np.uint8`][numpy.uint8]s etc.
+        mask : np.ndarray[tuple[int, ...], np.dtype[np.bool]]
+            The [boolean][numpy.bool] mask, of the same shape as the decoded
+            data, that was passed to `encode_masked`.
+        out : Buffer, optional
+            Writeable buffer to store decoded data. N.B. if provided, this
+            buffer must be exactly the right size to store the decoded data.
+
+        Returns
+        -------
+        dec : Buffer
+            Decoded data. May be any object supporting the new-style buffer
+            protocol. The values at masked positions are unspecified.
+        """
+
+        return self._decode(buf, mask, out)
+
+    def _decode(self, buf: Buffer, mask: None | Mask, out: None | Buffer) -> Buffer:
         b = numcodecs.compat.ensure_bytes(buf)
 
         b_io = BytesIO(b)
@@ -316,8 +400,10 @@ class _IntegerContextMixingCodec(Codec):
         mixer_rate, model_floor = np.frombuffer(b_io.read(16), dtype="<f8", count=2)
 
         T, Y, X = _as_slices(shape)
+        m = _mask_slices(mask, shape)
         q = self._decode_values(
             _padded_input(b_io.read()),
+            m,
             T,
             Y,
             X,
@@ -366,7 +452,9 @@ class ContextMixingSymbolCodec(_IntegerContextMixingCodec):
     [`ContextMixingResidualCodec`][numcodecs_context_mixing.ContextMixingResidualCodec]
     for large alphabets.
 
-    The array is interpreted as `[..., rows, cols]`.
+    The array is interpreted as `[..., rows, cols]`. Masked values (see
+    [`MaskAwareCodecMixin`][numcodecs_mask.abc.MaskAwareCodecMixin]) are
+    skipped.
 
     Parameters
     ----------
@@ -387,14 +475,19 @@ class ContextMixingSymbolCodec(_IntegerContextMixingCodec):
     ) -> None:
         super().__init__(mixer_rate=mixer_rate, model_floor=model_floor)
 
-    def _encode_values(self, q: np.ndarray, nbits: int, out: np.ndarray) -> int:
+    def _encode_values(
+        self, q: np.ndarray, m: np.ndarray, nbits: int, out: np.ndarray
+    ) -> int:
         return int(
-            _symbols.encode_symbols(q, nbits, out, self._mixer_rate, self._model_floor)
+            _symbols.encode_symbols(
+                q, m, nbits, out, self._mixer_rate, self._model_floor
+            )
         )
 
     def _decode_values(
         self,
         inp: np.ndarray,
+        m: np.ndarray,
         T: int,
         Y: int,
         X: int,
@@ -402,7 +495,7 @@ class ContextMixingSymbolCodec(_IntegerContextMixingCodec):
         mixer_rate: float,
         model_floor: float,
     ) -> np.ndarray:
-        return _symbols.decode_symbols(inp, T, Y, X, nbits, mixer_rate, model_floor)
+        return _symbols.decode_symbols(inp, m, T, Y, X, nbits, mixer_rate, model_floor)
 
 
 class ContextMixingResidualCodec(_IntegerContextMixingCodec):
@@ -418,7 +511,9 @@ class ContextMixingResidualCodec(_IntegerContextMixingCodec):
     activity, the disagreement of the two predictors, and the neighbouring
     residuals in the current and previous slice.
 
-    The array is interpreted as `[..., rows, cols]`.
+    The array is interpreted as `[..., rows, cols]`. Masked values (see
+    [`MaskAwareCodecMixin`][numcodecs_mask.abc.MaskAwareCodecMixin]) are
+    skipped.
 
     Parameters
     ----------
@@ -439,16 +534,19 @@ class ContextMixingResidualCodec(_IntegerContextMixingCodec):
     ) -> None:
         super().__init__(mixer_rate=mixer_rate, model_floor=model_floor)
 
-    def _encode_values(self, q: np.ndarray, nbits: int, out: np.ndarray) -> int:
+    def _encode_values(
+        self, q: np.ndarray, m: np.ndarray, nbits: int, out: np.ndarray
+    ) -> int:
         return int(
             _residuals.encode_residuals(
-                q, nbits, out, self._mixer_rate, self._model_floor
+                q, m, nbits, out, self._mixer_rate, self._model_floor
             )
         )
 
     def _decode_values(
         self,
         inp: np.ndarray,
+        m: np.ndarray,
         T: int,
         Y: int,
         X: int,
@@ -456,7 +554,9 @@ class ContextMixingResidualCodec(_IntegerContextMixingCodec):
         mixer_rate: float,
         model_floor: float,
     ) -> np.ndarray:
-        return _residuals.decode_residuals(inp, T, Y, X, nbits, mixer_rate, model_floor)
+        return _residuals.decode_residuals(
+            inp, m, T, Y, X, nbits, mixer_rate, model_floor
+        )
 
 
 numcodecs.registry.register_codec(ContextMixingBitmapCodec)
